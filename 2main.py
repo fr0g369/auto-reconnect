@@ -828,12 +828,12 @@ class UIManager:
             # Se TUDO falhar, pelo menos mostramos que está tentando
             title = "SISTEMA: MONITORIZANDO (Aguardando Dados...)"
             
-        table_packages = PrettyTable(
-            field_names=["Package", "Username", "Package Status"],
-            title=title,
-            border=True,
-            align="l"
-        )
+      #  table_packages = PrettyTable(
+         #   field_names=["Package", "Username", "Package Status"],
+         #   title=title,
+          #  border=True,
+          #  align="l"
+      #  )
 
         # Preenchimento da tabela (Lógica de ofuscação mantida)
         statuses = globals().get("package_statuses", {})
