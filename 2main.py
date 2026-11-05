@@ -799,6 +799,7 @@ class UIManager:
 
     @staticmethod
     def update_status_table():
+        return
         current_time = time.time()
         
         if current_time - UIManager.last_update_time < UIManager.update_interval:
