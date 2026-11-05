@@ -25,11 +25,11 @@ from rich.console import Console #type: ignore
 from threading import Lock, Event
 from psutil import boot_time, process_iter, cpu_percent, virtual_memory, Process, NoSuchProcess, AccessDenied, ZombieProcess
 
-try:
-    from prettytable import PrettyTable #type: ignore
-except ImportError:
-    os.system("pip install prettytable")
-    from prettytable import PrettyTable #type: ignore
+#try:
+    #from prettytable import PrettyTable #type: ignore
+#except ImportError:
+    #os.system("pip install prettytable")
+   # from prettytable import PrettyTable #type: ignore
 
 package_lock = Lock()
 status_lock = Lock()
