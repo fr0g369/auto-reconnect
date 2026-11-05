@@ -1,7 +1,6 @@
 pyotp
 requests
 pytz
-psutil
 rich
 prettytable
 flask
