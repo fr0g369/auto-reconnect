@@ -271,7 +271,7 @@ def login_gboard_estavel(lista_de_contas, nome_set):
     CAMPO_USER = "612 381" 
     BTN_GET_KEY = "901 417" 
 
-    LINK_FIXO = "https://www.roblox.com/share?code=90856ea1bf5ed54785ce8c39ee168245&type=Server"
+    LINK_FIXO = "https://www.roblox.com/share?code=228921c1aed4a74dbb1aabea1eeb99ff&type=Server"
 
     total = len(lista_de_contas)
 
