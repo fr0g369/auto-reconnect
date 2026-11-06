@@ -1,4 +1,6 @@
 import threading
+import re
+from collections import defaultdict
 import pyotp
 import time
 import json
@@ -32,6 +34,12 @@ from psutil import boot_time, process_iter, cpu_percent, virtual_memory, Process
    # from prettytable import PrettyTable #type: ignore
 
 package_lock = Lock()
+PKG_LOCKS = defaultdict(Lock)   # um lock por clone: impede dois relaunch ao mesmo tempo
+LAUNCH_TIMES = {}               # quando cada clone terminou de abrir/entrar
+LAUNCH_GRACE = 150              # segundos sem julgar "travado" depois de abrir
+HEARTBEAT_TIMEOUT = 120         # segundos sem o heartbeat mudar = travado
+MAX_RESTARTS = 5                # max reinicios por clone ...
+RESTART_WINDOW = 600            # ... nessa janela (s); passou disso, espera esfriar
 status_lock = Lock()
 rejoin_lock = Lock()
 bot_instance = None
@@ -572,30 +580,56 @@ class FileManager:
     
 class RobloxManager:
     @staticmethod
-    def check_game_crash_via_log(package_name):
-        """Monitora o sistema em busca de quedas do clone específico."""
-        try:
-            # Pega as últimas 50 mensagens de erro ou aviso do pacote
-            cmd = f"su -c 'logcat -d -t 50 *:W | grep {package_name}'"
-            log_output = os.popen(cmd).read().lower()
+    def get_pid(package_name):
+        """PID do clone (None = processo fechado). Casa o nome EXATO, sem substring."""
+        out = subprocess.getoutput(f"su -c 'pidof {package_name}'").strip()
+        pids = re.findall(r"\b\d+\b", out)
+        if pids and "not found" not in out.lower():
+            return pids[0]
+        # fallback se o pidof nao existir no aparelho
+        out = subprocess.getoutput(f"su -c 'ps -A | grep {package_name}'")
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[-1] == package_name and parts[1].isdigit():
+                return parts[1]
+        return None
 
-            # Palavras-chave que o Android dispara quando o Roblox desconecta ou fecha
-            errors = [
-                "connection lost", 
-                "disconnected", 
-                "win death", 
-                "force finishing",
-                "has died",
-                "kick"
-            ]
-            
-            for error in errors:
-                if error in log_output:
-                    return True # Se achar qualquer uma, manda reiniciar
+    @staticmethod
+    def has_anr(package_name, pid):
+        """ANR (app nao responde) registrado para ESTE pid. PID novo = log velho nao conta."""
+        out = subprocess.getoutput("su -c 'logcat -b events -d -t 500 | grep am_anr'")
+        return any(package_name in l and f",{pid}," in l for l in out.splitlines())
+
+    @staticmethod
+    def heartbeat_age(package_name, st):
+        """Segundos desde a ultima vez que o heartbeat do executor MUDOU.
+        None = esse clone ainda nao mostrou heartbeat (executor desligado ou script Lua antigo)."""
+        user_id = globals().get("_user_", {}).get(package_name)
+        if not user_id:
+            return None
+        mtime = None
+        for path in (f"/sdcard/Delta/workspace/{user_id}.main", f"/sdcard/Delta/{user_id}.main"):
+            out = subprocess.getoutput(f"su -c 'stat -c %Y {path}'").strip()
+            if out.isdigit():
+                mtime = out
+                break
+        now = time.time()
+        if mtime is not None and mtime != st["mtime"]:
+            if st["mtime"] is not None:
+                st["beating"] = True      # mudou de verdade => o Lua novo esta rodando
+            st["mtime"] = mtime
+            st["changed"] = now
+        return (now - st["changed"]) if st["beating"] else None
+
+    @staticmethod
+    def check_game_crash_via_log(package_name, pid):
+        """Log filtrado pelo PID atual (log de antes do restart nao dispara de novo)."""
+        try:
+            out = subprocess.getoutput(f"su -c 'logcat -d --pid={pid} -t 200 \"*:W\"'").lower()
+            return any(k in out for k in ("connection lost", "disconnected", "kicked"))
+        except Exception:
             return False
-        except:
-            return False
-    
+
     @staticmethod
     def check_user_online(user_id):
         url = "https://presence.roblox.com/v1/presence/last-online"
@@ -672,6 +706,11 @@ class RobloxManager:
 
     @staticmethod
     def launch_roblox(package_name, server_link):
+        with PKG_LOCKS[package_name]:
+            RobloxManager._launch_roblox(package_name, server_link)
+
+    @staticmethod
+    def _launch_roblox(package_name, server_link):
         try:
             RobloxManager.kill_roblox_process(package_name)
             time.sleep(2)
@@ -712,7 +751,9 @@ class RobloxManager:
                 UIManager.update_status_table()
             print(f"\033[1;31m[ Shouko.dev ] - {error_message}\033[0m")
             Utilities.log_error(error_message)
-        
+        finally:
+            LAUNCH_TIMES[package_name] = time.time()
+
     @staticmethod
     def format_server_link(input_link):
         """Garante que o link esteja no formato correto para o Android abrir o Roblox."""
@@ -908,6 +949,15 @@ pcall(function() writefile(myId .. ".main", "online") end)
 pcall(function() writefile("workspace/" .. myId .. ".main", "online") end)
 
 print("[Shouko.dev] SINAL DE VIDA ENVIADO: " .. myId)
+
+-- heartbeat: reescreve a cada 15s. Se o jogo travar/desconectar, o arquivo para de mudar
+task.spawn(function()
+    while true do
+        task.wait(15)
+        pcall(function() writefile(myId .. ".main", tostring(os.time())) end)
+        pcall(function() writefile("workspace/" .. myId .. ".main", tostring(os.time())) end)
+    end
+end)
     """
 
         # Pasta base do seu Delta conforme a Screenshot
@@ -1064,50 +1114,74 @@ class Runner:
 
     @staticmethod
     def monitor_presence(server_links, stop_event):
-        print("\033[1;34m[ DEBUG ] Monitor Anti-Crash (ROOT PS) ATIVO!\033[0m")
-    
+        print("\033[1;34m[ DEBUG ] Monitor Anti-Crash ATIVO (fechou / travou / ANR)\033[0m")
+        state = {}      # estado do heartbeat por clone
+        history = {}    # horarios dos restarts por clone
+
         while not stop_event.is_set():
             try:
-                # Garante que temos a lista correta para iterar
-                if isinstance(server_links, dict):
-                    items = list(server_links.items())
-                else:
-                    items = server_links
-  
+                items = list(server_links.items()) if isinstance(server_links, dict) else list(server_links)
+
                 for package_name, server_link in items:
-                    # 1. Checagem via PS (Exatamente o comando que você testou)
-                    # Usamos o strip() para limpar espaços e garantir que a comparação seja real
-                    check = subprocess.getoutput(f"su -c 'ps -e | grep {package_name}'").strip()
-                    
-                    # Se o pacote NÃO aparecer no texto retornado pelo PS
-                    if package_name not in check:
-                        print(f"\n\033[1;31m[ ! ] {package_name} NÃO ENCONTRADO. Reiniciando...\033[0m")
-                        
-                        os.system(f"su -c 'am force-stop {package_name}'")
-                        time.sleep(2)
-                        RobloxManager.launch_roblox(package_name, server_link)
-                        
-                        # Pausa para o Android não engasgar ao abrir o próximo
-                        time.sleep(10)
-                        continue # Pula para o próximo pacote
+                    if stop_event.is_set():
+                        break
+                    if PKG_LOCKS[package_name].locked():
+                        continue  # outra thread ja esta abrindo esse clone
 
-                    # 2. Se o processo existe, checamos o Logcat (conforme combinamos)
-                    if RobloxManager.check_game_crash_via_log(package_name):
-                        print(f"\n\033[1;33m[ ! ] {package_name} travado no Log. Reiniciando...\033[0m")
-                        os.system(f"su -c 'am force-stop {package_name}'")
-                        time.sleep(2)
-                        RobloxManager.launch_roblox(package_name, server_link)
-                        time.sleep(10)
+                    st = state.setdefault(package_name, {"pid": None, "mtime": None, "changed": time.time(), "beating": False})
+                    now = time.time()
+                    reason = None
 
-                # Ronda a cada 30 segundos
-                for _ in range(30):
-                    if stop_event.is_set(): break
+                    pid = RobloxManager.get_pid(package_name)
+                    if pid is None:
+                        reason = "fechou"
+                    else:
+                        if pid != st["pid"]:  # processo novo: zera o estado
+                            st.update(pid=pid, mtime=None, changed=now, beating=False)
+                        age = RobloxManager.heartbeat_age(package_name, st)
+                        in_grace = now - LAUNCH_TIMES.get(package_name, 0) < LAUNCH_GRACE
+                        if not in_grace:
+                            if RobloxManager.has_anr(package_name, pid):
+                                reason = "ANR (nao responde)"
+                            elif age is not None and age > HEARTBEAT_TIMEOUT:
+                                reason = f"travado (heartbeat parado ha {int(age)}s)"
+                            elif RobloxManager.check_game_crash_via_log(package_name, pid):
+                                reason = "desconectou (log)"
+
+                    if not reason:
+                        continue
+
+                    # freio: muitos restarts seguidos = algo esta errado, espera esfriar
+                    hist = [t for t in history.get(package_name, []) if now - t < RESTART_WINDOW]
+                    if len(hist) >= MAX_RESTARTS:
+                        print(f"\033[1;31m[ ! ] {package_name}: {MAX_RESTARTS} restarts em {RESTART_WINDOW//60} min, aguardando...\033[0m")
+                        continue
+                    hist.append(now)
+                    history[package_name] = hist
+
+                    print(f"\n\033[1;33m[ ! ] {package_name}: {reason}. Reiniciando...\033[0m")
+                    with status_lock:
+                        if package_name in globals()["package_statuses"]:
+                            globals()["package_statuses"][package_name]["Status"] = f"\033[1;31mRestart: {reason}\033[0m"
+                    try:
+                        UIManager.update_status_table()
+                    except Exception:
+                        pass
+                    ExecutorManager.reset_executor_file(package_name)
+                    RobloxManager.launch_roblox(package_name, server_link)  # ja faz force-stop antes
+                    st.update(pid=None, mtime=None, changed=time.time(), beating=False)
+                    time.sleep(5)
+
+                for _ in range(20):  # ronda a cada 20s
+                    if stop_event.is_set():
+                        break
                     time.sleep(1)
-            
+
             except Exception as e:
                 print(f"Erro no Monitor: {e}")
+                Utilities.log_error(f"Monitor error: {e}\n{traceback.format_exc()}")
                 time.sleep(10)
-            
+
     @staticmethod
     def force_rejoin(server_links, interval_minutes, stop_event):
         """
