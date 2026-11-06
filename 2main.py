@@ -38,6 +38,8 @@ PKG_LOCKS = defaultdict(Lock)   # um lock por clone: impede dois relaunch ao mes
 LAUNCH_TIMES = {}               # quando cada clone terminou de abrir/entrar
 LAUNCH_GRACE = 150              # segundos sem julgar "travado" depois de abrir
 HEARTBEAT_TIMEOUT = 120         # segundos sem o heartbeat mudar = travado
+PRESENCE_EVERY = 60             # consulta a API de presenca a cada N segundos (1 request p/ todos)
+PRESENCE_STRIKES = 3            # checagens seguidas fora do jogo antes de reiniciar
 MAX_RESTARTS = 5                # max reinicios por clone ...
 RESTART_WINDOW = 600            # ... nessa janela (s); passou disso, espera esfriar
 status_lock = Lock()
@@ -580,6 +582,26 @@ class FileManager:
     
 class RobloxManager:
     @staticmethod
+    def get_presence(user_ids):
+        """{user_id: tipo} pela API de presenca (0 offline, 1 site, 2 em jogo, 3 studio).
+        Retorna {} em erro/rate limit, e nesse caso ninguem e reiniciado."""
+        try:
+            ids = [int(u) for u in user_ids]
+            if not ids:
+                return {}
+            res = requests.post(
+                "https://presence.roblox.com/v1/presence/users",
+                json={"userIds": ids[:50]},
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+            if res.status_code != 200:
+                return {}
+            return {str(p["userId"]): p.get("userPresenceType") for p in res.json().get("userPresences", [])}
+        except Exception:
+            return {}
+
+    @staticmethod
     def get_pid(package_name):
         """PID do clone (None = processo fechado). Casa o nome EXATO, sem substring."""
         out = subprocess.getoutput(f"su -c 'pidof {package_name}'").strip()
@@ -1117,10 +1139,19 @@ class Runner:
         print("\033[1;34m[ DEBUG ] Monitor Anti-Crash ATIVO (fechou / travou / ANR)\033[0m")
         state = {}      # estado do heartbeat por clone
         history = {}    # horarios dos restarts por clone
+        presence = {}   # ultimo tipo de presenca por user_id
+        strikes = defaultdict(int)  # checagens seguidas "fora do jogo" por clone
+        last_presence = 0
 
         while not stop_event.is_set():
             try:
                 items = list(server_links.items()) if isinstance(server_links, dict) else list(server_links)
+
+                refresh_presence = time.time() - last_presence >= PRESENCE_EVERY
+                if refresh_presence:
+                    uids = [globals()["_user_"].get(pk) for pk, _ in items]
+                    presence = RobloxManager.get_presence([u for u in uids if u])
+                    last_presence = time.time()
 
                 for package_name, server_link in items:
                     if stop_event.is_set():
@@ -1148,6 +1179,18 @@ class Runner:
                             elif RobloxManager.check_game_crash_via_log(package_name, pid):
                                 reason = "desconectou (log)"
 
+                        # presenca: conta fora do jogo por varias checagens seguidas
+                        if refresh_presence and not in_grace and not reason:
+                            ptype = presence.get(str(globals()["_user_"].get(package_name)))
+                            if ptype is None:
+                                pass  # sem resposta da API: nao conta
+                            elif ptype != 2:
+                                strikes[package_name] += 1
+                                if strikes[package_name] >= PRESENCE_STRIKES:
+                                    reason = f"conta fora do jogo (presenca={ptype})"
+                            else:
+                                strikes[package_name] = 0
+
                     if not reason:
                         continue
 
@@ -1170,6 +1213,7 @@ class Runner:
                     ExecutorManager.reset_executor_file(package_name)
                     RobloxManager.launch_roblox(package_name, server_link)  # ja faz force-stop antes
                     st.update(pid=None, mtime=None, changed=time.time(), beating=False)
+                    strikes[package_name] = 0
                     time.sleep(5)
 
                 for _ in range(20):  # ronda a cada 20s
