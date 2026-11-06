@@ -37,9 +37,9 @@ package_lock = Lock()
 PKG_LOCKS = defaultdict(Lock)   # um lock por clone: impede dois relaunch ao mesmo tempo
 LAUNCH_TIMES = {}               # quando cada clone terminou de abrir/entrar
 LAUNCH_GRACE = 150              # segundos sem julgar "travado" depois de abrir
-HEARTBEAT_TIMEOUT = 120         # segundos sem o heartbeat mudar = travado
-PRESENCE_EVERY = 60             # consulta a API de presenca a cada N segundos (1 request p/ todos)
-PRESENCE_STRIKES = 3            # checagens seguidas fora do jogo antes de reiniciar
+HEARTBEAT_TIMEOUT = 60          # segundos sem o heartbeat mudar = travado
+PRESENCE_EVERY = 30             # consulta a API de presenca a cada N segundos (1 request p/ todos)
+PRESENCE_STRIKES = 2            # checagens seguidas fora do jogo antes de reiniciar
 MAX_RESTARTS = 5                # max reinicios por clone ...
 RESTART_WINDOW = 600            # ... nessa janela (s); passou disso, espera esfriar
 status_lock = Lock()
@@ -1216,7 +1216,7 @@ class Runner:
                     strikes[package_name] = 0
                     time.sleep(5)
 
-                for _ in range(20):  # ronda a cada 20s
+                for _ in range(10):  # ronda a cada 10s
                     if stop_event.is_set():
                         break
                     time.sleep(1)
