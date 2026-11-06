@@ -1041,7 +1041,7 @@ end)
             # FASE 1: Espera o Executor injetar (Limite de 3 min)
             while time.time() - start_time < 180:
                 if ExecutorManager.check_executor_status(package_name):
-                    globals()["package_statuses"][package_name]["Status"] = "\033[1;32mFarming (30m)...\033[0m"
+                    globals()["package_statuses"][package_name]["Status"] = "\033[1;32mFarming (3h)...\033[0m"
                     UIManager.update_status_table()
                     executor_loaded = True
                 
@@ -1052,8 +1052,8 @@ end)
                 time.sleep(10)
             if executor_loaded:
                 # FASE 2: O Tempo de Farm (30 minutos colhendo frutos)
-                time.sleep(1800) 
-                print(f"\033[1;36m[ Shouko.dev ] - Tempo de 30min esgotado para {package_name}. Resetando...\033[0m")
+                time.sleep(3 * 3600) 
+                print(f"\033[1;36m[ Shouko.dev ] - Tempo de 3h esgotado para {package_name}. Resetando...\033[0m")
             else:
                 # FASE 3: Se der Timeout (3 min sem sinal), pula para o reset para tentar de novo
                 print(f"\033[1;31m[ Shouko.dev ] - Timeout no executor de {package_name}!\033[0m")
@@ -1389,7 +1389,7 @@ def main():
 
                 # 2. AUTO-CONFIG: Em vez de input(), definimos o tempo automático
                 # Aqui você escolhe: 30 minutos (30 * 60)
-                f_interval = 60 * 60 
+                f_interval = 3 * 60 * 60 
                 print(f"\033[93m[ AUTO ] Force Rejoin definido para: 30 minutos\033[0m")
 
                 # 3. Inicia os clones (O motor do farm)
