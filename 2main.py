@@ -1390,7 +1390,7 @@ def main():
                 # 2. AUTO-CONFIG: Em vez de input(), definimos o tempo automático
                 # Aqui você escolhe: 30 minutos (30 * 60)
                 f_interval = 3 * 60 * 60 
-                print(f"\033[93m[ AUTO ] Force Rejoin definido para: 30 minutos\033[0m")
+                print("\033[93m[ AUTO ] Reset periodico: a cada 3 horas (check_executor_and_rejoin)\033[0m")
 
                 # 3. Inicia os clones (O motor do farm)
                 RobloxManager.kill_roblox_processes()
@@ -1400,7 +1400,6 @@ def main():
                 # 4. Ativa as Threads (Monitor e Rejoin)
                 stop_main_event.clear()
                 threading.Thread(target=Runner.monitor_presence, args=(server_links, stop_main_event), daemon=True).start()
-                threading.Thread(target=Runner.force_rejoin, args=(server_links, f_interval, stop_main_event), daemon=True).start()
 
                 print("\033[1;32m[ ✓ ] Sistema de Monitoramento Ativo!\033[0m")
   
