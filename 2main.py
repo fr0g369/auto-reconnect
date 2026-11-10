@@ -1,4 +1,6 @@
 import threading
+import asyncio
+import io
 import re
 from collections import defaultdict
 import pyotp
@@ -34,6 +36,7 @@ from psutil import boot_time, process_iter, cpu_percent, virtual_memory, Process
    # from prettytable import PrettyTable #type: ignore
 
 package_lock = Lock()
+MONITOR_PAUSED = Event()        # /monitor desligar no Discord liga isso
 PKG_LOCKS = defaultdict(Lock)   # um lock por clone: impede dois relaunch ao mesmo tempo
 LAUNCH_TIMES = {}               # quando cada clone terminou de abrir/entrar
 LAUNCH_GRACE = 150              # segundos sem julgar "travado" depois de abrir
@@ -1088,6 +1091,176 @@ end)
         except Exception as e:
             print(f"Erro no reset: {e}")
 
+class DiscordControl:
+    """Controle remoto pelo Discord (slash commands). So o dono (owner_id) consegue usar.
+    Config em Shouko.dev/discord.json: {"token": "...", "owner_id": 123, "guild_id": 123}"""
+    CONFIG = os.path.join("Shouko.dev", "discord.json")
+    client = None
+    loop = None
+    owner_id = None
+    ready = False
+
+    @staticmethod
+    def _clean(text):
+        return re.sub(r"\x1b\[[0-9;]*m", "", str(text))
+
+    @staticmethod
+    def notify(text):
+        """Pode ser chamado de qualquer thread. Manda DM pro dono; falha em silencio."""
+        try:
+            if not DiscordControl.ready or DiscordControl.loop is None:
+                return
+
+            async def _send():
+                user = await DiscordControl.client.fetch_user(DiscordControl.owner_id)
+                await user.send(str(text)[:1900])
+
+            asyncio.run_coroutine_threadsafe(_send(), DiscordControl.loop)
+        except Exception:
+            pass
+
+    @staticmethod
+    def start(server_links):
+        if not os.path.exists(DiscordControl.CONFIG):
+            print("\033[1;33m[ Discord ] Desativado (falta Shouko.dev/discord.json)\033[0m")
+            return
+        try:
+            with open(DiscordControl.CONFIG, "r") as f:
+                cfg = json.load(f)
+            token = cfg["token"]
+            owner_id = int(cfg["owner_id"])
+            guild_id = cfg.get("guild_id")
+        except Exception as e:
+            print(f"\033[1;31m[ Discord ] discord.json invalido: {e}\033[0m")
+            return
+        try:
+            import discord  # noqa: F401
+        except ImportError:
+            print("\033[1;31m[ Discord ] Instale com: pip install discord.py\033[0m")
+            return
+        threading.Thread(target=DiscordControl._run, args=(token, owner_id, guild_id, list(server_links)), daemon=True).start()
+
+    @staticmethod
+    def _run(token, owner_id, guild_id, server_links):
+        import discord
+        from discord import app_commands
+
+        links = dict(server_links)
+        client = discord.Client(intents=discord.Intents.default())
+        tree = app_commands.CommandTree(client)
+        guild = discord.Object(id=int(guild_id)) if guild_id else None
+        gk = {"guild": guild} if guild else {}
+        DiscordControl.client = client
+        DiscordControl.owner_id = owner_id
+        synced = {"done": False}
+
+        async def owner_only(interaction):
+            if interaction.user.id != owner_id:
+                await interaction.response.send_message("Sem permissao.", ephemeral=True)
+                return False
+            return True
+
+        async def ac_pacote(interaction, current: str):
+            names = ["all"] + list(links)
+            return [app_commands.Choice(name=n, value=n) for n in names if current.lower() in n.lower()][:25]
+
+        def do_restart(pk):
+            ExecutorManager.reset_executor_file(pk)
+            RobloxManager.launch_roblox(pk, links[pk])
+
+        @tree.command(name="status", description="Mostra o estado de cada clone", **gk)
+        async def status(interaction: discord.Interaction):
+            if not await owner_only(interaction):
+                return
+            await interaction.response.defer(thinking=True, ephemeral=True)
+            lines = []
+            for pk in links:
+                pid = await asyncio.to_thread(RobloxManager.get_pid, pk)
+                info = globals().get("package_statuses", {}).get(pk, {})
+                user = DiscordControl._clean(info.get("Username", "?"))
+                st = DiscordControl._clean(info.get("Status", "?"))
+                lines.append(f"{pk}\n  {'ABERTO' if pid else 'FECHADO'} | {user} | {st}")
+            paused = " (monitor DESLIGADO)" if MONITOR_PAUSED.is_set() else ""
+            await interaction.followup.send(f"```\n" + "\n".join(lines)[:1800] + f"\n```{paused}")
+
+        @tree.command(name="restart", description="Reinicia um clone (ou todos)", **gk)
+        @app_commands.describe(pacote="Nome do pacote ou 'all'")
+        @app_commands.autocomplete(pacote=ac_pacote)
+        async def restart(interaction: discord.Interaction, pacote: str):
+            if not await owner_only(interaction):
+                return
+            targets = list(links) if pacote == "all" else [pacote]
+            if any(t not in links for t in targets):
+                await interaction.response.send_message("Pacote nao encontrado.", ephemeral=True)
+                return
+            await interaction.response.defer(thinking=True, ephemeral=True)
+            done, busy = [], []
+            for t in targets:
+                if PKG_LOCKS[t].locked():
+                    busy.append(t)
+                    continue
+                await asyncio.to_thread(do_restart, t)
+                done.append(t)
+            msg = f"Reiniciado: {', '.join(done) or 'nenhum'}"
+            if busy:
+                msg += f"\nJa estavam abrindo: {', '.join(busy)}"
+            await interaction.followup.send(msg)
+
+        @tree.command(name="print", description="Print da tela do cloud phone", **gk)
+        async def print_cmd(interaction: discord.Interaction):
+            if not await owner_only(interaction):
+                return
+            await interaction.response.defer(thinking=True, ephemeral=True)
+            try:
+                res = await asyncio.to_thread(
+                    subprocess.run, ["su", "-c", "screencap -p"], capture_output=True, timeout=20
+                )
+                data = res.stdout
+            except Exception as e:
+                await interaction.followup.send(f"Falha no screencap: {e}")
+                return
+            if not data.startswith(b"\x89PNG") or len(data) > 8_000_000:
+                await interaction.followup.send("Nao consegui gerar o print.")
+                return
+            await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="print.png"))
+
+        @tree.command(name="monitor", description="Liga/desliga o monitor anti-crash", **gk)
+        @app_commands.choices(estado=[
+            app_commands.Choice(name="ligar", value="on"),
+            app_commands.Choice(name="desligar", value="off"),
+        ])
+        async def monitor(interaction: discord.Interaction, estado: app_commands.Choice[str]):
+            if not await owner_only(interaction):
+                return
+            if estado.value == "off":
+                MONITOR_PAUSED.set()
+            else:
+                MONITOR_PAUSED.clear()
+            await interaction.response.send_message(f"Monitor {'DESLIGADO' if estado.value == 'off' else 'ligado'}.", ephemeral=True)
+
+        @client.event
+        async def on_ready():
+            DiscordControl.loop = asyncio.get_running_loop()
+            DiscordControl.ready = True
+            if not synced["done"]:
+                synced["done"] = True
+                try:
+                    await tree.sync(guild=guild)
+                except Exception as e:
+                    print(f"\033[1;31m[ Discord ] Falha ao sincronizar comandos: {e}\033[0m")
+            print(f"\033[1;32m[ Discord ] Conectado como {client.user}\033[0m")
+            DiscordControl.notify("🤖 Bot online. Comandos: /status /restart /print /monitor")
+
+        async def runner():
+            await client.start(token)
+
+        try:
+            asyncio.run(runner())
+        except Exception as e:
+            DiscordControl.ready = False
+            print(f"\033[1;31m[ Discord ] Erro: {e}\033[0m")
+
+
 class Runner:
 
     def launch_package_sequentially(server_links):
@@ -1145,6 +1318,9 @@ class Runner:
 
         while not stop_event.is_set():
             try:
+                if MONITOR_PAUSED.is_set():
+                    time.sleep(5)
+                    continue
                 items = list(server_links.items()) if isinstance(server_links, dict) else list(server_links)
 
                 refresh_presence = time.time() - last_presence >= PRESENCE_EVERY
@@ -1203,6 +1379,7 @@ class Runner:
                     history[package_name] = hist
 
                     print(f"\n\033[1;33m[ ! ] {package_name}: {reason}. Reiniciando...\033[0m")
+                    DiscordControl.notify(f"⚠️ {package_name}: {reason}. Reiniciando...")
                     with status_lock:
                         if package_name in globals()["package_statuses"]:
                             globals()["package_statuses"][package_name]["Status"] = f"\033[1;31mRestart: {reason}\033[0m"
@@ -1212,6 +1389,7 @@ class Runner:
                         pass
                     ExecutorManager.reset_executor_file(package_name)
                     RobloxManager.launch_roblox(package_name, server_link)  # ja faz force-stop antes
+                    DiscordControl.notify(f"✅ {package_name}: reaberto.")
                     st.update(pid=None, mtime=None, changed=time.time(), beating=False)
                     strikes[package_name] = 0
                     time.sleep(5)
@@ -1400,6 +1578,7 @@ def main():
                 # 4. Ativa as Threads (Monitor e Rejoin)
                 stop_main_event.clear()
                 threading.Thread(target=Runner.monitor_presence, args=(server_links, stop_main_event), daemon=True).start()
+                DiscordControl.start(server_links)
 
                 print("\033[1;32m[ ✓ ] Sistema de Monitoramento Ativo!\033[0m")
   
